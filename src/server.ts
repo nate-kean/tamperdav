@@ -1,4 +1,6 @@
-import fs from "node:fs";
+import type { Stats } from "node:fs";
+
+import fs from "node:fs/promises";
 import upath from "upath";
 import http from "http";
 import crypto from "crypto";
@@ -33,6 +35,7 @@ type WatcherEntry = {
 	currentCursor: number;
 };
 type WatcherCache = { [key: string]: WatcherEntry };
+type Method = (url: URL, request: Request, response: Response) => Promise<void>;
 
 if (process.argv.includes("--help")) {
 	console.log(
@@ -103,10 +106,22 @@ const ALLOWED_METHODS = [
 	.concat(args["open-in-editor"] ? ["EDITOR"] : [])
 	.join(",");
 
-type Method = (url: URL, request: Request, response: Response) => void;
+async function exists(path: Parameters<typeof fs.access>[0]): Promise<boolean> {
+	try {
+		await fs.access(path, fs.constants.F_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function parseeIntt(str: string | readonly string[] | undefined): number {
+	// @ts-expect-error TS2345: parseInt accepts more types than TS acts like it does
+	return parseInt(str, 10);
+}
 
 const methods: { [key: string]: Method } = {
-	options: (_, __, response) => {
+	async options(_, __, response) {
 		response.setHeader("Access-Control-Allow-Methods", ALLOWED_METHODS);
 		response.setHeader("Access-Control-Allow-Credentials", "true");
 		response.setHeader(
@@ -117,7 +132,7 @@ const methods: { [key: string]: Method } = {
 		response.statusCode = 200;
 		response.end();
 	},
-	propfind: (url, request, response) => {
+	async propfind(url, request, response) {
 		const rpath = url.pathname;
 		const fpath = upath.join(WORKING_DIR, rpath);
 
@@ -127,20 +142,19 @@ const methods: { [key: string]: Method } = {
 			return;
 		}
 
-		if (!fs.existsSync(fpath)) {
+		if (!(await exists(fpath))) {
 			response.statusCode = 404;
 			response.end();
 			return;
 		}
 
 		let xml;
-		if (!fs.statSync(fpath).isDirectory()) {
+		if (!(await fs.stat(fpath)).isDirectory()) {
 			xml = arrayToXml(rpath, [""]);
 		} else {
 			const wc = watcherCache[rpath];
-			// @ts-expect-error TS2345: parseInt accepts more types than TS acts like it does
-			const depth = parseInt(request.headers.depth);
-			const files = depth !== 0 ? fs.readdirSync(fpath) : [];
+			const depth = parseeIntt(request.headers.depth);
+			const files = depth !== 0 ? await fs.readdir(fpath) : [];
 
 			xml = arrayToXml(
 				rpath,
@@ -153,7 +167,7 @@ const methods: { [key: string]: Method } = {
 		response.setHeader("Content-Type", "application/xml; charset=utf-8");
 		response.end(xml);
 	},
-	mkcol: (url, request, response) => {
+	async mkcol(url, request, response) {
 		const rpath = url.pathname;
 		const fpath = upath.join(WORKING_DIR, rpath);
 
@@ -163,7 +177,7 @@ const methods: { [key: string]: Method } = {
 			return;
 		}
 
-		if (fs.existsSync(fpath)) {
+		if (!(await exists(fpath))) {
 			response.statusCode = 405;
 			response.end(
 				'<d:error xmlns:d="DAV:" xmlns:td="http://dav.tampermonkey.net/ns">' +
@@ -175,14 +189,14 @@ const methods: { [key: string]: Method } = {
 		}
 
 		try {
-			fs.mkdirSync(fpath);
-			return methods.propfind(url, request, response);
+			await fs.mkdir(fpath);
+			return await methods.propfind(url, request, response);
 		} catch {
 			response.statusCode = 422;
 			response.end();
 		}
 	},
-	get: (url, _, response) => {
+	async get(url, _, response) {
 		const rpath = url.pathname;
 		const fpath = upath.join(WORKING_DIR, rpath);
 
@@ -191,14 +205,14 @@ const methods: { [key: string]: Method } = {
 			response.end();
 			return;
 		}
-		if (!fs.existsSync(fpath)) {
+		if (!(await exists(fpath))) {
 			response.statusCode = 404;
 			response.end();
 		}
 
 		let contents;
 		try {
-			contents = fs.readFileSync(fpath);
+			contents = await fs.readFile(fpath);
 			response.statusCode = 200;
 			response.setHeader("Content-Type", "application/octet-stream");
 		} catch (err) {
@@ -209,7 +223,7 @@ const methods: { [key: string]: Method } = {
 			response.end(contents);
 		}
 	},
-	editor: (url, request, response) => {
+	async editor(url, request, response) {
 		const useEditor = args["open-in-editor"];
 		if (!useEditor || args.headless) {
 			response.statusCode = 501;
@@ -233,7 +247,7 @@ const methods: { [key: string]: Method } = {
 			response.end();
 			return;
 		}
-		if (!fs.existsSync(fpath)) {
+		if (!(await exists(fpath))) {
 			response.statusCode = 404;
 			response.end();
 			return;
@@ -247,7 +261,7 @@ const methods: { [key: string]: Method } = {
 		response.statusCode = 302;
 		response.end();
 	},
-	put: (url, request, response) => {
+	async put(url, request, response) {
 		const rpath = url.pathname;
 		const fpath = upath.join(WORKING_DIR, rpath);
 
@@ -260,13 +274,13 @@ const methods: { [key: string]: Method } = {
 		const data: Buffer[] = [];
 		request.on("data", data.push);
 
-		request.on("end", () => {
-			fs.writeFileSync(fpath, Buffer.concat(data));
+		request.on("end", async () => {
+			await fs.writeFile(fpath, Buffer.concat(data));
 
 			const timestamp = request.headers["x-oc-mtime"];
 			if (typeof timestamp === "string") {
 				try {
-					fs.utimesSync(fpath, timestamp, timestamp);
+					await fs.utimes(fpath, timestamp, timestamp);
 					response.setHeader("X-OC-Mtime", "accepted");
 				} catch (err) {
 					console.error(
@@ -280,7 +294,7 @@ const methods: { [key: string]: Method } = {
 			response.end();
 		});
 	},
-	delete: (url, _, response) => {
+	async delete(url, _, response) {
 		const rpath = url.pathname;
 		const fpath = upath.join(WORKING_DIR, rpath);
 
@@ -291,7 +305,7 @@ const methods: { [key: string]: Method } = {
 		}
 
 		try {
-			fs.unlinkSync(fpath);
+			await fs.unlink(fpath);
 			response.statusCode = 204;
 			response.end();
 		} catch (err) {
@@ -300,7 +314,7 @@ const methods: { [key: string]: Method } = {
 			response.end();
 		}
 	},
-	head: (url, _, response) => {
+	async head(url, _, response) {
 		const rpath = url.pathname;
 		const fpath = upath.join(WORKING_DIR, rpath);
 
@@ -311,16 +325,16 @@ const methods: { [key: string]: Method } = {
 		}
 
 		let success = false;
-		let stats: fs.Stats | null = null;
-		if (fs.existsSync(fpath)) {
+		let stats: Stats | undefined;
+		if (await exists(fpath)) {
 			try {
-				stats = fs.statSync(fpath);
+				stats = await fs.stat(fpath);
 			} catch (err) {
 				console.error(`stat file ${rpath} failed`, err.message);
 			}
-			if (stats !== null) {
+			if (stats !== undefined) {
 				response.statusCode = 200;
-				response.setHeader("Content-Length", stats.size);
+				response.setHeader("Content-Length", stats.size.toString());
 				response.setHeader("Content-Type", "application/octet-stream");
 				response.end();
 				success = true;
@@ -331,7 +345,7 @@ const methods: { [key: string]: Method } = {
 			response.end();
 		}
 	},
-	subscribe: (url, request, response) => {
+	async subscribe(url, request, response) {
 		const rpath = url.pathname;
 		const fpath = upath.join(WORKING_DIR, rpath);
 
@@ -340,12 +354,12 @@ const methods: { [key: string]: Method } = {
 			response.end();
 			return;
 		}
-		if (!fs.existsSync(fpath)) {
+		if (!(await exists(fpath))) {
 			response.statusCode = 404;
 			response.end();
 			return;
 		}
-		if (!fs.statSync(fpath).isDirectory()) {
+		if (!(await fs.stat(fpath)).isDirectory()) {
 			response.statusCode = 400;
 			response.end();
 			return;
@@ -371,11 +385,11 @@ const methods: { [key: string]: Method } = {
 
 		const fromCursor =
 			url.searchParams.get("cursor") ?? request.headers.cursor;
-		sendCachedWatcherChanges(rpath, parseInt(fromCursor, 10));
+		sendCachedWatcherChanges(rpath, parseeIntt(fromCursor));
 	},
 };
 
-function arrayToXml(
+async function arrayToXml(
 	rpath: string,
 	filenames: readonly string[],
 	cursor?: number,
@@ -386,19 +400,16 @@ function arrayToXml(
 	for (const filename of filenames) {
 		const cpath = upath.join(fpath, filename);
 
-		let stats, isDir;
+		let mtime = new Date();
+		let size = -1;
+		let isDir = false;
 		try {
-			stats = fs.statSync(cpath);
+			const stats = await fs.stat(cpath);
+			size = stats.size;
+			mtime = stats.mtime;
 			isDir = stats.isDirectory();
-		} catch {
-			stats = {
-				mtime: Date.now(),
-				size: -1,
-			};
-			isDir = false;
-		}
+		} catch {}
 
-		const mtime = new Date(stats.mtimeMs ?? stats.mtime);
 		const lastModified = mtime.toUTCString();
 
 		return [
@@ -412,7 +423,7 @@ function arrayToXml(
 				: "<d:resourcetype />",
 			isDir
 				? "<d:getcontentlength />"
-				: `<d:getcontentlength>${stats.size}</d:getcontentlength>`,
+				: `<d:getcontentlength>${size}</d:getcontentlength>`,
 			"</d:prop>",
 			"<d:status>HTTP/1.1 200 OK</d:status>",
 			"</d:propstat>",
@@ -455,7 +466,7 @@ function sendCachedWatcherChanges(rpath: string, fromCursor: number): boolean {
 		}
 	}
 
-	const changeKeys = Object.keys(entry.cursorChanges).map(parseInt);
+	const changeKeys = Object.keys(entry.cursorChanges).map(parseeIntt);
 	if (changeKeys.length > 0 && changeKeys.length > maxCursors) {
 		const m = entry.currentCursor - maxCursors + 1;
 		for (const changeKey of changeKeys) {
@@ -474,7 +485,7 @@ function assureWatcher(rpath: string) {
 
 	const fpath = upath.join(WORKING_DIR, rpath);
 	let entry: WatcherEntry | null = null;
-	const onChange = (_path: string) => {
+	const onChange = async (_path: string) => {
 		const path = upath.normalize(_path);
 		const filename = path.replace(
 			new RegExp("^" + RegExp.escape(fpath) + "\/?"),
@@ -483,17 +494,15 @@ function assureWatcher(rpath: string) {
 		if (args["meta-touch"]) {
 			let m, meta, n;
 			if (
-				(m = path.match(/(.*)\.user.js$/)) &&
-				(n = m[1]) &&
+				(m = path.match(/(.*)\.user.js$/)) !== null &&
+				(n = m?.[1]) !== undefined &&
 				(meta = `${n}.meta.json`) &&
-				fs.existsSync(meta)
+				await exists(meta)
 			) {
 				if (args.debug) console.log("metatouch: ", meta);
 				try {
-					// This is nuts! But this seems to be the only way to update file timestamps reliably at Windows 10
-					// require('touch'), fs.utimes -> EPERM: operation not permitted, futime
-					const contents = fs.readFileSync(meta);
-					fs.writeFileSync(meta, contents);
+					const now = new Date();
+					await fs.utimes(meta, now, now);
 				} catch (err) {
 					console.error(err);
 				}
