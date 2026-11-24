@@ -120,6 +120,33 @@ function parseeIntt(str: string | readonly string[] | undefined): number {
 	return parseInt(str, 10);
 }
 
+function getRF(url: URL): [string, string] {
+	const rpath = url.pathname;
+	const fpath = upath.join(WORKING_DIR, rpath);
+	return [rpath, fpath];
+}
+
+async function checkPath(fpath: string, response: Response): Promise<boolean> {
+	if (!fpath.startsWith(WORKING_DIR)) {
+		response.statusCode = 403;
+		response.end();
+		return false;
+	}
+	return true;
+}
+
+async function checkExists(
+	fpath: string,
+	response: Response,
+): Promise<boolean> {
+	if (!(await exists(fpath))) {
+		response.statusCode = 404;
+		response.end();
+		return false;
+	}
+	return true;
+}
+
 const methods: { [key: string]: Method } = {
 	async options(_, __, response) {
 		response.setHeader("Access-Control-Allow-Methods", ALLOWED_METHODS);
@@ -133,20 +160,9 @@ const methods: { [key: string]: Method } = {
 		response.end();
 	},
 	async propfind(url, request, response) {
-		const rpath = url.pathname;
-		const fpath = upath.join(WORKING_DIR, rpath);
-
-		if (!fpath.startsWith(WORKING_DIR)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
-
-		if (!(await exists(fpath))) {
-			response.statusCode = 404;
-			response.end();
-			return;
-		}
+		const [rpath, fpath] = getRF(url);
+		if (!(await checkPath(fpath, response))) return;
+		if (!(await checkExists(fpath, response))) return;
 
 		let xml;
 		if (!(await fs.stat(fpath)).isDirectory()) {
@@ -154,11 +170,11 @@ const methods: { [key: string]: Method } = {
 		} else {
 			const wc = watcherCache[rpath];
 			const depth = parseeIntt(request.headers.depth);
-			const files = depth !== 0 ? await fs.readdir(fpath) : [];
-
+			const filenames = depth !== 0 ? await fs.readdir(fpath) : [];
+			filenames.unshift(".");
 			xml = arrayToXml(
 				rpath,
-				["."].concat(files),
+				filenames,
 				wc && depth !== 0 ? wc.currentCursor : undefined,
 			);
 		}
@@ -168,14 +184,8 @@ const methods: { [key: string]: Method } = {
 		response.end(xml);
 	},
 	async mkcol(url, request, response) {
-		const rpath = url.pathname;
-		const fpath = upath.join(WORKING_DIR, rpath);
-
-		if (!fpath.startsWith(WORKING_DIR)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
+		const [_, fpath] = getRF(url);
+		if (!(await checkExists(fpath, response))) return;
 
 		if (!(await exists(fpath))) {
 			response.statusCode = 405;
@@ -197,20 +207,11 @@ const methods: { [key: string]: Method } = {
 		}
 	},
 	async get(url, _, response) {
-		const rpath = url.pathname;
-		const fpath = upath.join(WORKING_DIR, rpath);
+		const [__, fpath] = getRF(url);
+		if (!(await checkPath(fpath, response))) return;
+		if (!(await checkExists(fpath, response))) return;
 
-		if (!fpath.startsWith(WORKING_DIR)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
-		if (!(await exists(fpath))) {
-			response.statusCode = 404;
-			response.end();
-		}
-
-		let contents;
+		let contents: Buffer | string | undefined;
 		try {
 			contents = await fs.readFile(fpath);
 			response.statusCode = 200;
@@ -218,10 +219,15 @@ const methods: { [key: string]: Method } = {
 		} catch (err) {
 			console.error(err);
 			response.statusCode = 500;
-			contents = err.message;
-		} finally {
-			response.end(contents);
+			contents =
+				typeof err === "object" &&
+				err !== null &&
+				"message" in err &&
+				typeof err.message === "string"
+					? err.message
+					: "Catastrophy";
 		}
+		response.end(contents);
 	},
 	async editor(url, request, response) {
 		const useEditor = args["open-in-editor"];
@@ -239,19 +245,9 @@ const methods: { [key: string]: Method } = {
 			}
 		}
 
-		const rpath = url.pathname;
-		const fpath = upath.join(WORKING_DIR, rpath);
-
-		if (!fpath.startsWith(WORKING_DIR)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
-		if (!(await exists(fpath))) {
-			response.statusCode = 404;
-			response.end();
-			return;
-		}
+		const [_, fpath] = getRF(url);
+		if (!(await checkPath(fpath, response))) return;
+		if (!(await checkExists(fpath, response))) return;
 
 		open(upath.resolve(fpath), { app: editorPath });
 		response.setHeader(
@@ -262,14 +258,8 @@ const methods: { [key: string]: Method } = {
 		response.end();
 	},
 	async put(url, request, response) {
-		const rpath = url.pathname;
-		const fpath = upath.join(WORKING_DIR, rpath);
-
-		if (!fpath.startsWith(WORKING_DIR)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
+		const [_, fpath] = getRF(url);
+		if (!(await checkExists(fpath, response))) return;
 
 		const data: Buffer[] = [];
 		request.on("data", data.push);
@@ -283,10 +273,8 @@ const methods: { [key: string]: Method } = {
 					await fs.utimes(fpath, timestamp, timestamp);
 					response.setHeader("X-OC-Mtime", "accepted");
 				} catch (err) {
-					console.error(
-						`setting mtime ${timestamp} failed`,
-						err.message,
-					);
+					console.error(`setting mtime ${timestamp} failed`);
+					console.error(err);
 				}
 			}
 
@@ -295,34 +283,22 @@ const methods: { [key: string]: Method } = {
 		});
 	},
 	async delete(url, _, response) {
-		const rpath = url.pathname;
-		const fpath = upath.join(WORKING_DIR, rpath);
-
-		if (!fpath.startsWith(WORKING_DIR)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
+		const [rpath, fpath] = getRF(url);
+		if (!(await checkExists(fpath, response))) return;
 
 		try {
 			await fs.unlink(fpath);
 			response.statusCode = 204;
-			response.end();
 		} catch (err) {
-			console.error(`deleting file ${rpath} failed`, err.message);
+			console.error(`deleting file ${rpath} failed`);
+			console.error(err);
 			response.statusCode = 404;
-			response.end();
 		}
+		response.end();
 	},
 	async head(url, _, response) {
-		const rpath = url.pathname;
-		const fpath = upath.join(WORKING_DIR, rpath);
-
-		if (!fpath.startsWith(WORKING_DIR)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
+		const [rpath, fpath] = getRF(url);
+		if (!(await checkExists(fpath, response))) return;
 
 		let success = false;
 		let stats: Stats | undefined;
@@ -330,35 +306,26 @@ const methods: { [key: string]: Method } = {
 			try {
 				stats = await fs.stat(fpath);
 			} catch (err) {
-				console.error(`stat file ${rpath} failed`, err.message);
+				console.error(`stat file ${rpath} failed`);
+				console.error(err);
 			}
 			if (stats !== undefined) {
 				response.statusCode = 200;
 				response.setHeader("Content-Length", stats.size.toString());
 				response.setHeader("Content-Type", "application/octet-stream");
-				response.end();
 				success = true;
 			}
 		}
 		if (!success) {
 			response.statusCode = 404;
-			response.end();
 		}
+		response.end();
 	},
 	async subscribe(url, request, response) {
-		const rpath = url.pathname;
-		const fpath = upath.join(WORKING_DIR, rpath);
+		const [rpath, fpath] = getRF(url);
+		if (!(await checkPath(fpath, response))) return;
+		if (!(await checkExists(fpath, response))) return;
 
-		if (!fpath.startsWith(WORKING_DIR)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
-		if (!(await exists(fpath))) {
-			response.statusCode = 404;
-			response.end();
-			return;
-		}
 		if (!(await fs.stat(fpath)).isDirectory()) {
 			response.statusCode = 400;
 			response.end();
@@ -432,7 +399,11 @@ async function arrayToXml(
 	}
 	const entriesStr = entries.join("\n");
 	const newCursor = cursor ? `<td:cursor>${cursor}</td:cursor>` : "";
-	return `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:td="http://dav.tampermonkey.net/ns">${entriesStr}${newCursor}</d:multistatus>`;
+	return (
+		'<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:td="http://dav.tampermonkey.net/ns">' +
+		`${entriesStr}${newCursor}` +
+		"</d:multistatus>"
+	);
 }
 
 function notifySubscribers(
@@ -497,7 +468,7 @@ function assureWatcher(rpath: string) {
 				(m = path.match(/(.*)\.user.js$/)) !== null &&
 				(n = m?.[1]) !== undefined &&
 				(meta = `${n}.meta.json`) &&
-				await exists(meta)
+				(await exists(meta))
 			) {
 				if (args.debug) console.log("metatouch: ", meta);
 				try {
